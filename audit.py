@@ -54,15 +54,19 @@ def make_variants() -> list[Config]:
 
 
 def run_variants(df: pd.DataFrame, configs: list[Config],
-                 cost_bps: float) -> pd.DataFrame:
-    """Weekly net returns, one column per variant."""
-    out = {}
+                 cost_bps: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Weekly net returns (one column per variant), plus each variant's
+    gross Sharpe and average turnover."""
+    net, extra = {}, {}
     for i, cfg in enumerate(configs, 1):
         preds = walk_forward_predict(df, cfg)
         fwd = df.loc[preds.index, "fwd_ret"]
-        out[cfg.name] = strategy_returns(long_short_weights(preds), fwd, cost_bps)["net"]
+        res = strategy_returns(long_short_weights(preds), fwd, cost_bps)
+        net[cfg.name] = res["net"]
+        extra[cfg.name] = {"gross_sharpe": metrics(res["gross"])["sharpe"],
+                           "avg_turnover": res["turnover"].mean()}
         print(f"[{i}/{len(configs)}] {cfg.name}")
-    return pd.DataFrame(out)
+    return pd.DataFrame(net), pd.DataFrame(extra).T
 
 
 def deflated_sharpe(returns: pd.DataFrame) -> dict:
@@ -136,13 +140,19 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     df = build_dataset(pd.read_parquet(args.data))
-    returns = run_variants(df, make_variants(), args.cost_bps).dropna()
+    returns, extra = run_variants(df, make_variants(), args.cost_bps)
+    returns = returns.dropna()
 
-    table = pd.DataFrame({c: metrics(returns[c]) for c in returns}).T
-    table.sort_values("sharpe", ascending=False).to_csv(out / "variants.csv")
+    table = pd.DataFrame({c: metrics(returns[c]) for c in returns}).T.join(extra)
+    table = table.rename(columns={"sharpe": "net_sharpe"})
+    table.sort_values("net_sharpe", ascending=False).to_csv(out / "variants.csv")
 
     dsr = deflated_sharpe(returns)
     pbo = probability_of_backtest_overfitting(returns)
+
+    # Is the variant ranking driven by skill or by trading costs?
+    rho_turnover = table["avg_turnover"].corr(table["net_sharpe"], method="spearman")
+    rho_gross = table["gross_sharpe"].corr(table["net_sharpe"], method="spearman")
 
     report = "\n".join([
         "# Overfitting audit",
@@ -156,6 +166,10 @@ def main():
         "(probability the best variant's true Sharpe is above zero)",
         f"- Probability of backtest overfitting: {pbo['pbo']:.1%} "
         f"(over {pbo['n_splits']:,} CSCV splits)",
+        f"- Variants with positive gross Sharpe (before costs): "
+        f"{(table['gross_sharpe'] > 0).sum()} of {len(table)}",
+        f"- Rank correlation across variants, turnover vs net Sharpe: {rho_turnover:+.2f}",
+        f"- Rank correlation across variants, gross vs net Sharpe: {rho_gross:+.2f}",
         "",
         "Reading it: DSR above 0.95 means the best result is unlikely to be "
         "luck. PBO near 50% means picking the in-sample winner is no better "
